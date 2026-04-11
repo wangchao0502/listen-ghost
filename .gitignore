@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.claude/
+listen-ghost.log
+build/
+dist/
+*.spec.bak
