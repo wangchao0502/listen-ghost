@@ -31,8 +31,16 @@ log = logging.getLogger(__name__)
 import numpy as np
 
 from listen_ghost.audio_capture import AudioCapture, find_loopback_device
-from listen_ghost.pitch_detector import PitchDetector
+from listen_ghost.pitch_detector import (
+    PitchDetector, VocalPitchDetector,
+    VOCAL_FREQ_MIN, VOCAL_FREQ_MAX,
+)
 from listen_ghost.threading_bridge import AudioQueue
+
+# ── Scene constants ───────────────────────────────────────────────────────────
+
+SCENE_GENERAL: str = 'general'   # polyphonic FFT — any pitched sound
+SCENE_VOCAL: str   = 'vocal'     # monophonic YIN — optimised for singing voice
 
 # ── UI constants ──────────────────────────────────────────────────────────────
 
@@ -48,10 +56,13 @@ FG_STATUS: str = '#6a6a9a'
 FG_ERROR: str = '#ff6b6b'
 ACCENT: str = '#7b68ee'
 ACCENT_STOP: str = '#c0392b'
+BG_SCENE_ACTIVE: str = '#2a2a4e'   # scene button: selected
+BG_SCENE_IDLE: str   = '#111126'   # scene button: unselected
 
 NOTE_FONT: tuple = ('Consolas', 34, 'bold')
 STATUS_FONT: tuple = ('Segoe UI', 8)
 BTN_FONT: tuple = ('Segoe UI', 12, 'bold')
+SCENE_FONT: tuple = ('Segoe UI', 9)
 
 SPECTRUM_BARS: int = 48       # number of bars in the spectrum display
 SPECTRUM_FREQ_MIN: float = 80.0
@@ -88,9 +99,10 @@ class ListenGhostApp:
         self.root = root
         self._running: bool = False
         self._capture: Optional[AudioCapture] = None
-        self._detector: Optional[PitchDetector] = None
+        self._detector = None          # PitchDetector | VocalPitchDetector | None
         self._audio_queue: AudioQueue = AudioQueue(maxsize=10)
-        self._spectrum_data: Optional[np.ndarray] = None  # latest FFT magnitude
+        self._spectrum_data: Optional[np.ndarray] = None
+        self._scene: str = SCENE_VOCAL  # default — the most common use case
 
         self._setup_window()
         self._build_ui()
@@ -129,7 +141,35 @@ class ListenGhostApp:
             cursor='hand2',
             command=self._toggle_capture,
         )
-        self.btn_toggle.pack(fill='x', padx=8, pady=(8, 4))
+        self.btn_toggle.pack(fill='x', padx=8, pady=(8, 2))
+
+        # ── Scene selector ──
+        scene_frame = tk.Frame(self.root, bg=BG_DARK)
+        scene_frame.pack(fill='x', padx=8, pady=(0, 2))
+
+        tk.Label(
+            scene_frame, text='场景：', bg=BG_DARK, fg=FG_STATUS, font=SCENE_FONT,
+        ).pack(side='left')
+
+        self._scene_btns: dict = {}
+        for label, value, tooltip in [
+            ('通用', SCENE_GENERAL, '多音 · 乐器 / 和声'),
+            ('人声', SCENE_VOCAL,   '单音 · 演唱者音高'),
+        ]:
+            btn = tk.Button(
+                scene_frame,
+                text=label,
+                font=SCENE_FONT,
+                relief='flat', bd=0,
+                padx=10, pady=2,
+                cursor='hand2',
+                command=lambda v=value: self._set_scene(v),
+            )
+            btn.pack(side='left', padx=(0, 3))
+            self._scene_btns[value] = btn
+
+        # Initialise button highlight to match default scene
+        self._refresh_scene_buttons()
 
         # ── Status / device label ──
         self.lbl_status = tk.Label(
@@ -183,6 +223,34 @@ class ListenGhostApp:
             )
             self._bar_ids.append(bar_id)
 
+    # ── Scene management ──────────────────────────────────────────────────────
+
+    def _set_scene(self, scene: str) -> None:
+        """Switch detection scene.  Safe to call while capture is running."""
+        if scene == self._scene:
+            return
+        self._scene = scene
+        self._refresh_scene_buttons()
+        log.info('Scene switched to %r', scene)
+        # Hot-swap the detector so the audio thread picks it up immediately.
+        # CPython assignment is atomic w.r.t. the GIL, so no explicit lock needed.
+        if self._running and self._capture is not None:
+            self._detector = self._make_detector(self._capture.sample_rate)
+
+    def _refresh_scene_buttons(self) -> None:
+        """Highlight the currently active scene button."""
+        for value, btn in self._scene_btns.items():
+            if value == self._scene:
+                btn.config(bg=ACCENT, fg='white')
+            else:
+                btn.config(bg=BG_SCENE_ACTIVE, fg=FG_STATUS)
+
+    def _make_detector(self, sample_rate: int):
+        """Return a freshly constructed detector for the current scene."""
+        if self._scene == SCENE_VOCAL:
+            return VocalPitchDetector(sample_rate=sample_rate)
+        return PitchDetector(sample_rate=sample_rate)
+
     # ── Audio control ─────────────────────────────────────────────────────────
 
     def _toggle_capture(self) -> None:
@@ -206,8 +274,9 @@ class ListenGhostApp:
                 callback=self._on_audio_block,
                 device=device,
             )
-            self._detector = PitchDetector(sample_rate=self._capture.sample_rate)
-            log.info('AudioCapture created: %s @ %d Hz', self._capture.device_name, self._capture.sample_rate)
+            self._detector = self._make_detector(self._capture.sample_rate)
+            log.info('AudioCapture created: %s @ %d Hz  scene=%s',
+                     self._capture.device_name, self._capture.sample_rate, self._scene)
             self._capture.start()
             log.info('Stream started')
         except Exception as exc:
@@ -292,10 +361,14 @@ class ListenGhostApp:
         spectrum = np.abs(np.fft.rfft(block * window, n=FFT_PAD))
         freqs = np.fft.rfftfreq(FFT_PAD, d=1.0 / (self._capture.sample_rate if self._capture else 48000))
 
+        # In vocal mode narrow the spectrum view to the vocal range so the
+        # singer's fundamental is always in the visible window.
+        spec_max = VOCAL_FREQ_MAX if self._scene == SCENE_VOCAL else SPECTRUM_FREQ_MAX
+
         # Log-spaced frequency bins for the bars
         log_freqs = np.logspace(
             np.log10(SPECTRUM_FREQ_MIN),
-            np.log10(SPECTRUM_FREQ_MAX),
+            np.log10(spec_max),
             num=SPECTRUM_BARS + 1,
         )
 
