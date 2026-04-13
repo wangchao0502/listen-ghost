@@ -25,6 +25,13 @@ python main.py
 # 运行测试（无需音频硬件）
 python -m pytest tests/ -v
 
+# 生成默认测试音频缓存（12 单音 + 6 和弦，输出到 audios/）
+python scripts/gen_test_audio.py
+
+# 将乐谱渲染为 WAV（缺失音频自动补生成）
+python scripts/compose.py                  # 运行内置示例乐谱
+python scripts/compose.py my_score.py      # 加载外部乐谱文件
+
 # 打包
 pyinstaller build.spec
 ```
@@ -40,6 +47,8 @@ pyinstaller build.spec
 | `listen_ghost/app.py` | tkinter UI、场景切换、频谱可视化 |
 | `tests/test_pitch_detector.py` | 86 个单元测试，覆盖全部检测路径 |
 | `tests/test_threading_bridge.py` | `AudioQueue` 单元测试 |
+| `scripts/gen_test_audio.py` | 加法合成钢琴音频缓存生成器（单音 + 和弦，输出到 `audios/`） |
+| `scripts/compose.py` | 乐谱渲染器：将乐谱数据结构合成为完整 WAV 文件 |
 
 ## 重要设计决策
 
@@ -107,3 +116,35 @@ harm_match_tol = 0.75 * (self.sample_rate / FFT_PAD)  # ≈4.4 Hz @ 48kHz
 - 贝斯信号统一定义为 G2（98 Hz）+ 6 次谐波，振幅梯度 0.8/0.6/0.4/0.3/0.2/0.15
 - `_run_detector(det, block, n_frames=8)`：连续送入 8 帧相同块，取最后结果（让平滑窗口 `SMOOTH_FRAMES=5` 稳定）
 - F4（349 Hz）测试接受 `'F4'` 或 `'F#4'`（Hanning 泄漏谷频率偏移，属已知限制）
+
+### 测试音频生成脚本
+
+需要真实 WAV 文件（端到端测试、手动试听）时，使用 `scripts/` 中的两个工具：
+
+**`scripts/gen_test_audio.py`** — 生成默认时长（2s）音频缓存
+
+```python
+# 直接修改文件顶部的 SINGLE_NOTES / CHORDS 可扩展覆盖范围
+python scripts/gen_test_audio.py
+# 输出: audios/single/C4.wav, audios/chord/Cmaj.wav ...
+```
+
+**`scripts/compose.py`** — 将乐谱数据结构渲染为完整 WAV
+
+```python
+# 在 compose.py 内或外部 .py 文件中定义 score 变量：
+score = {
+    "tempo":    100,                      # BPM
+    "output":   "audios/output/demo.wav",
+    "sequence": [
+        ("Cmaj", 4),   # (名称, 拍数)
+        ("Am",   4),
+        ("C5",   2),   # 单音：音名 + 八度数
+    ]
+}
+# 缓存缺失时自动调用 gen_test_audio 补生成
+python scripts/compose.py               # 内置示例
+python scripts/compose.py my_score.py   # 外部文件
+```
+
+支持的和弦名见 `scripts/compose.py` 的 `CHORD_VOICINGS` 字典（43 个，含大/小三和弦、大七/属七/小七/挂留）。

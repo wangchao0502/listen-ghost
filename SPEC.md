@@ -44,9 +44,15 @@ listen-ghost/
 ├── main.py                          # 入口：DPI 设置 + 自动补丁 + 依赖检查 + 启动
 ├── requirements.txt
 ├── build.spec                       # PyInstaller 打包配置
-├── audios/                          # 测试音频文件
+├── audios/
+│   ├── single/                      # 单音缓存（由 gen_test_audio.py 生成）
+│   ├── chord/                       # 和弦缓存（由 gen_test_audio.py 生成）
+│   └── output/                      # compose.py 渲染输出
+├── scripts/
+│   ├── gen_test_audio.py            # 加法合成钢琴音频生成器（单音 + 和弦缓存）
+│   └── compose.py                   # 乐谱渲染器（乐谱数据结构 → WAV）
 ├── tests/
-│   ├── test_pitch_detector.py       # 音高检测单元测试（69 个）
+│   ├── test_pitch_detector.py       # 音高检测单元测试（86 个）
 │   └── test_threading_bridge.py     # 队列单元测试
 └── listen_ghost/
     ├── __init__.py
