@@ -108,11 +108,15 @@ class PitchDetector:
         # 2. Hann 窗 + rfft（零填充 8192 点，5.4Hz/bin 分辨率 @ 48kHz）
         # 3. 转 dB（相对峰值），限制 80Hz–2000Hz 频带
         # 4. 找局部极大值（>= DB_THRESHOLD = -30dB）
-        # 5. suppress_harmonics：去除整数倍谐波（±5% 容差）
-        # 6. filter_close_notes：去除相距 <3 半音的较弱音
-        # 7. freq_to_note：频率 → MIDI → 音名 + 八度
-        # 8. 3帧多数投票平滑（连续出现 ≥2 帧才显示）
-        # 9. 返回最多 MAX_NOTES=6 个音名，按响度降序
+        # 5. suppress_harmonics：按频率升序，去除任意低频的整数倍峰（±5% 容差）
+        #    → 无论哪个更响，始终保留低频基频、抑制高频泛音
+        # 6. harmonic_coverage 过滤：统计每个幸存基频的强泛音数（>= -20dB）
+        #    → 最高分 ≥2 时，只保留得分 ≥ max_score-2 的音
+        #    → 过滤同情共振弦（0-1 个泛音）；和弦各音（4+ 个泛音）全部保留
+        # 7. filter_close_notes：去除相距 <3 半音的较弱音
+        # 8. freq_to_note：频率 → MIDI → 音名 + 八度
+        # 9. 5帧多数投票平滑（连续出现 ≥3 帧才显示）
+        # 10. 返回最多 MAX_NOTES=6 个音名，按响度降序
 ```
 
 ### YIN 音高检测（人声场景）
@@ -140,6 +144,19 @@ class PitchDetector:
 ```
 
 **关键常量：**
+
+**通用模式关键常量：**
+
+| 常量 | 值 | 说明 |
+|------|----|------|
+| `DB_THRESHOLD` | -30 dB | 峰值候选最低电平（相对帧峰值） |
+| `HARMONIC_TOL` | 0.05 | 谐波频率匹配容差 ±5% |
+| `HARMONIC_SCORE_MIN_DB` | -20 dB | 计入谐波覆盖度的最低电平 |
+| `SMOOTH_FRAMES` | 5 | 多数投票平滑窗口帧数 |
+| `SMOOTH_MIN_VOTES` | 3 | 显示所需最少出票帧数 |
+| `MAX_NOTES` | 6 | 最多同时显示音符数 |
+
+**人声模式关键常量：**
 
 | 常量 | 值 | 说明 |
 |------|----|------|
@@ -207,6 +224,7 @@ pyinstaller build.spec
 
 - **人声场景**：无源分离能力，在人声与贝斯频率直接重叠（如演唱者唱 D4 而贝斯正好在 G2 的 3 倍频处）时，可能漏检。
 - **F4 附近频率**：349 Hz 落在贝斯三、四次谐波之间的 Hanning 泄漏谷，FFT 回退的频率估计可能偏移约半音（显示 F#4 而非 F4）。
+- **通用模式高音区**（E5 以上）：FREQ_MAX=2000 Hz 内可容纳的泛音数量 ≤1，谐波覆盖度过滤进入 fallback 模式（显示所有幸存基频），同情共振抑制效果减弱。
 
 ## 开发历程
 
@@ -217,7 +235,9 @@ pyinstaller build.spec
 | `WasapiSettings` 无 `loopback` 参数 | sounddevice 从未支持此参数 | 改用 `soundcard` 库，原生支持 WASAPI Loopback |
 | `CO_E_NOTINITIALIZED (0x800401f0)` | Windows COM 未在录音线程初始化 | 线程启动时调 `CoInitializeEx(None, 0)` |
 | `numpy.fromstring` 已移除 | soundcard 0.4.x 兼容 numpy 1.x，numpy 2.0 删除了二进制模式 | main.py 启动时自动检测并补丁 |
-| 谐波被检测为独立音（通用） | FFT 对基频整数倍同样产生峰值 | `suppress_harmonics()`：±5% 容差过滤整数倍频 |
+| 谐波被检测为独立音（通用） | FFT 对基频整数倍同样产生峰值 | `suppress_harmonics()`：按频率升序，±5% 容差过滤整数倍频，始终保留低频基频 |
+| 泛音比基频响时基频丢失（通用） | 钢琴第 2 泛音（高八度）常比基频更响，旧响度优先方式把泛音当基频 | 改为频率升序处理，无论响度高低，整数倍高频一律抑制 |
+| 钢琴衰减段（~1s 后）出现多余音（通用） | 同情共振弦随主音衰减变得相对更响，超过 -30 dB 阈值被误识 | `harmonic_coverage` 过滤：只保留有 ≥2 个强泛音（>-20 dB）的基频 |
 | 相邻半音误检（通用） | FFT bin 间距在高频区接近半音宽度 | `filter_close_notes()`：3 半音最小间距 |
 | 人声模式一直显示 G2 | `VOCAL_FREQ_MIN=80 Hz` 让 YIN 搜索范围覆盖贝斯基频（98 Hz），贝斯自相关置信度 0.998 压倒一切 | 提高 `VOCAL_FREQ_MIN` 至 150 Hz + 高通滤波 |
 | A4/C5 等音符被误判为贝斯谐波 | 次谐波检查容差 ±35 Hz（1.5 × DFT bin）过宽，落入 Hanning 泄漏区，导致假阳性 | 收紧容差至 ±4.4 Hz（0.75 × 零填充 bin），仅匹配真实贝斯谐波的量化位置 |

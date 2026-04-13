@@ -38,10 +38,24 @@ pyinstaller build.spec
 | `listen_ghost/pitch_detector.py` | 全部检测逻辑：`PitchDetector`、`VocalPitchDetector`、辅助函数 |
 | `listen_ghost/threading_bridge.py` | `AudioQueue`：音频线程→UI线程非阻塞队列 |
 | `listen_ghost/app.py` | tkinter UI、场景切换、频谱可视化 |
-| `tests/test_pitch_detector.py` | 69 个单元测试，覆盖全部检测路径 |
+| `tests/test_pitch_detector.py` | 86 个单元测试，覆盖全部检测路径 |
 | `tests/test_threading_bridge.py` | `AudioQueue` 单元测试 |
 
 ## 重要设计决策
+
+### 通用模式：谐波抑制方向
+
+`_suppress_harmonics()` 按**频率升序**判断整数倍关系，始终保留低频（基频），抑制高频（泛音）——无论哪个更响。
+
+**不要改回按响度降序处理。** 钢琴第 2 泛音（高八度）往往比基频更响，旧方式会把泛音当基频保留，导致同一音符重复显示。
+
+### 通用模式：谐波覆盖度过滤
+
+`_peaks_to_notes()` 在谐波抑制后，对每个幸存基频计算"强泛音数"（高于 `HARMONIC_SCORE_MIN_DB = -20 dB` 的整数倍频峰数量）。若最高分 ≥ 2，则只保留得分 ≥ `max_score − 2`（最低 1）的音。
+
+**目的：** 消除钢琴衰减段（~1s 后）出现的同情共振（sympathetic resonance）。共振弦是被演奏音的泛音激励的单频振动，自身无泛音序列（得分 0–1），被过滤；真正和弦各音有完整谐波列（得分 4+），全部保留。
+
+**不要把 `-20 dB` 阈值调低至 -30 dB。** 噪声峰会被误计为谐波，导致共振弦得分虚高，过滤失效。
 
 ### 人声模式次谐波检查容差
 
@@ -71,7 +85,7 @@ harm_match_tol = 0.75 * (self.sample_rate / FFT_PAD)  # ≈4.4 Hz @ 48kHz
 
 ### 修改检测逻辑
 
-- 任何修改需通过 `python -m pytest tests/ -v` 全部 69 个测试
+- 任何修改需通过 `python -m pytest tests/ -v` 全部 86 个测试
 - 人声模式回归测试集在 `TestVocalPitchDetector` 中，包含贝斯+人声混音场景
 - 修改 `harm_match_tol` 前，阅读 `SPEC.md` 中「已知限制」和「已解决的关键问题」
 
@@ -91,5 +105,5 @@ harm_match_tol = 0.75 * (self.sample_rate / FFT_PAD)  # ≈4.4 Hz @ 48kHz
 
 - 测试不依赖音频硬件，全部使用 numpy 合成信号
 - 贝斯信号统一定义为 G2（98 Hz）+ 6 次谐波，振幅梯度 0.8/0.6/0.4/0.3/0.2/0.15
-- `_run_detector(det, block, n_frames=8)`：连续送入 8 帧相同块，取最后结果（让平滑窗口稳定）
+- `_run_detector(det, block, n_frames=8)`：连续送入 8 帧相同块，取最后结果（让平滑窗口 `SMOOTH_FRAMES=5` 稳定）
 - F4（349 Hz）测试接受 `'F4'` 或 `'F#4'`（Hanning 泄漏谷频率偏移，属已知限制）

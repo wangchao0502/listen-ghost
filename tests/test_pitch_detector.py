@@ -17,6 +17,7 @@ from listen_ghost.pitch_detector import (
     _filter_close_notes,
     _note_to_midi,
     _peaks_to_notes,
+    _harmonic_coverage,
     PitchDetector,
     # Vocal
     _highpass_fft,
@@ -28,6 +29,7 @@ from listen_ghost.pitch_detector import (
     VOCAL_FREQ_MIN,
     VOCAL_FREQ_MAX,
     YIN_CONFIDENCE_MIN,
+    HARMONIC_SCORE_MIN_DB,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -142,6 +144,25 @@ class TestSuppressHarmonics:
         result = _suppress_harmonics(peaks)
         assert all(f == 200.0 for _, f in result)
 
+    def test_harmonic_louder_than_fundamental(self):
+        """Piano scenario: 2nd harmonic (C5) louder than fundamental (C4).
+        The fundamental must still be kept and the harmonic suppressed."""
+        # C5 (523.25 Hz) at -2 dB, C4 (261.63 Hz) at -3 dB — C5 is louder
+        peaks = [(-2.0, 523.25), (-3.0, 261.63)]
+        result = _suppress_harmonics(peaks)
+        assert len(result) == 1
+        assert result[0][1] == pytest.approx(261.63)
+
+    def test_multiple_harmonics_louder_than_fundamental(self):
+        """Piano chord C4: 2nd and 3rd partials both louder than fundamental."""
+        # 2nd partial (C5, 523.25) and 3rd partial (G5, 784.88) both louder
+        peaks = [(-1.0, 523.25), (-2.0, 784.88), (-5.0, 261.63)]
+        result = _suppress_harmonics(peaks)
+        freqs = [f for _, f in result]
+        assert 261.63 in freqs            # fundamental kept
+        assert 523.25 not in freqs        # 2nd partial suppressed
+        assert 784.88 not in freqs        # 3rd partial suppressed
+
     def test_empty_input(self):
         assert _suppress_harmonics([]) == []
 
@@ -170,6 +191,48 @@ class TestFilterCloseNotes:
 
     def test_empty(self):
         assert _filter_close_notes([]) == []
+
+
+# ── _harmonic_coverage ────────────────────────────────────────────────────────
+
+class TestHarmonicCoverage:
+    def test_counts_strong_harmonics(self):
+        """Peaks at 2×, 3×, 4× the fundamental should all count."""
+        peaks = [(0.0, 880.0), (-3.0, 1320.0), (-6.0, 1760.0)]  # 2nd/3rd/4th of 440
+        assert _harmonic_coverage(440.0, peaks) == 3
+
+    def test_ignores_weak_peaks_below_min_db(self):
+        """Peaks weaker than HARMONIC_SCORE_MIN_DB should not count."""
+        peaks = [(HARMONIC_SCORE_MIN_DB - 1.0, 880.0)]  # just below threshold
+        assert _harmonic_coverage(440.0, peaks) == 0
+
+    def test_ignores_non_harmonic_peaks(self):
+        """Peaks at non-integer ratios should not count."""
+        peaks = [(0.0, 660.0)]  # 1.5× — not integer
+        assert _harmonic_coverage(440.0, peaks) == 0
+
+    def test_ignores_peaks_below_f_hz(self):
+        """Only upper harmonics are counted; lower frequencies are ignored."""
+        peaks = [(0.0, 220.0)]  # below 440
+        assert _harmonic_coverage(440.0, peaks) == 0
+
+    def test_empty_peaks(self):
+        assert _harmonic_coverage(440.0, []) == 0
+
+    def test_sympathetic_resonance_scores_low(self):
+        """E4 sympathetic resonance in a C4-only spectrum has ≤1 harmonic score."""
+        # C4 spectrum: strong harmonics at C5/G5/C6; E4's harmonics (B4/E5) absent
+        peaks = [
+            (0.0, 523.25),    # C5 = 2×C4
+            (-2.0, 784.88),   # G5 = 3×C4
+            (-5.0, 1046.5),   # C6 = 4×C4
+            (-5.4, 329.63),   # E4 sympathetic resonance
+            (-9.4, 261.63),   # C4 fundamental
+        ]
+        c4_score = _harmonic_coverage(261.63, peaks)
+        e4_score = _harmonic_coverage(329.63, peaks)
+        assert c4_score >= 3, f"C4 should score ≥3, got {c4_score}"
+        assert e4_score == 0, f"E4 resonance should score 0, got {e4_score}"
 
 
 # ── PitchDetector ─────────────────────────────────────────────────────────────
@@ -212,11 +275,80 @@ class TestPitchDetector:
         result = _run_detector(det, block)
         assert len(result) <= MAX_NOTES
 
-    def test_temporal_smoothing_suppresses_single_frame_noise(self):
-        """A note that appears in only 1 frame should be suppressed after 3 frames."""
+    def test_piano_harmonic_louder_than_fundamental(self):
+        """Piano-like signal: 2nd harmonic louder than fundamental.
+        Should detect only the fundamental (C4), not C5."""
         det = PitchDetector(sample_rate=SR)
-        # Feed 2 silence frames then 1 tone frame: tone should NOT appear in history
-        for _ in range(2):
+        # C4 at amp=0.3, C5 (2nd harmonic) louder at amp=0.5
+        block = _sine(261.63, amp=0.3) + _sine(523.25, amp=0.5)
+        result = _run_detector(det, block)
+        assert 'C4' in result, f"C4 not found in {result}"
+        assert 'C5' not in result, f"C5 (harmonic) should be suppressed, got {result}"
+
+    @pytest.mark.parametrize('note,freq', [
+        ('C4', 261.63),
+        ('D4', 293.66),
+        ('E4', 329.63),
+        ('G4', 392.00),
+        ('A4', 440.00),
+        ('C5', 523.25),
+    ])
+    def test_piano_scale_single_note_only(self, note, freq):
+        """Each piano scale note (with harmonics) should appear without its
+        octave-above harmonic being displayed alongside it."""
+        det = PitchDetector(sample_rate=SR)
+        # Simulate piano timbre: fundamental + 2nd harmonic 3 dB louder
+        block = _sine(freq, amp=0.3) + _sine(freq * 2, amp=0.5)
+        result = _run_detector(det, block)
+        assert note in result, f"{note} not found; got {result}"
+        octave_above = freq_to_note(freq * 2)
+        assert octave_above not in result, (
+            f"Octave harmonic {octave_above} should be suppressed; got {result}"
+        )
+
+    def _piano_tone(self, f0: float, fund_amp: float) -> np.ndarray:
+        """Piano-like block: fundamental + 5 harmonics with natural decay profile."""
+        amps = [1.0, 1.5, 1.2, 0.8, 0.5, 0.3]  # typical piano partial amplitudes
+        block = np.zeros(BLOCK, dtype=np.float32)
+        for h, rel in enumerate(amps, start=1):
+            block += _sine(f0 * h, amp=fund_amp * rel)
+        return block
+
+    def test_piano_decay_no_sympathetic_resonances(self):
+        """Late-decay piano C4: sympathetic single-sine resonances at E4 and G4
+        must NOT appear alongside the fundamental."""
+        det = PitchDetector(sample_rate=SR)
+        # C4 late-decay (fundamental quiet, harmonics still present)
+        c4 = self._piano_tone(261.63, fund_amp=0.05)
+        # Sympathetic resonances: single sines — no harmonic series of their own
+        resonances = _sine(329.63, amp=0.08) + _sine(392.0, amp=0.04)
+        block = c4 + resonances
+        result = _run_detector(det, block)
+        # Only C4 should appear; E4 and G4 resonances should be filtered by
+        # harmonic-coverage scoring (they have 0–1 strong harmonics vs C4's 5).
+        assert 'C4' in result, f"C4 not found in {result}"
+        assert 'E4' not in result, f"E4 sympathetic resonance shown: {result}"
+        assert 'G4' not in result, f"G4 sympathetic resonance shown: {result}"
+
+    def test_real_chord_all_notes_shown(self):
+        """A real C-major chord (C4+E4+G4) with full harmonic series for each note
+        must display all three chord tones — not filter them as 'resonances'."""
+        det = PitchDetector(sample_rate=SR)
+        # Each chord tone has its own rich harmonic series
+        chord = (self._piano_tone(261.63, fund_amp=0.3)
+                 + self._piano_tone(329.63, fund_amp=0.25)
+                 + self._piano_tone(392.0,  fund_amp=0.2))
+        result = _run_detector(det, chord)
+        # All three chord tones should be detected
+        assert 'C4' in result, f"C4 missing from chord: {result}"
+        assert 'E4' in result, f"E4 missing from chord: {result}"
+        assert 'G4' in result, f"G4 missing from chord: {result}"
+
+    def test_temporal_smoothing_suppresses_single_frame_noise(self):
+        """A note that appears in only 1 frame should be suppressed after smoothing."""
+        det = PitchDetector(sample_rate=SR)
+        # Feed silence frames then 1 tone frame: tone should NOT appear in history
+        for _ in range(4):
             det.process(_silence())
         result = det.process(_sine(440.0, 0.5))
         # After just 1 frame of tone (with 2 silence frames), votes < SMOOTH_MIN_VOTES

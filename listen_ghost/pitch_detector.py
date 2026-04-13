@@ -38,8 +38,12 @@ DB_THRESHOLD: float = -30.0  # dB re peak; peaks below this are noise
 MAX_NOTES: int = 6           # maximum polyphonic display count
 FFT_PAD: int = 8192          # zero-pad length → ~5.4 Hz/bin at 44100 Hz
 HARMONIC_TOL: float = 0.05   # ±5 % frequency tolerance for harmonic detection
-SMOOTH_FRAMES: int = 3       # number of frames kept for majority-vote smoothing
-SMOOTH_MIN_VOTES: int = 2    # minimum frames a note must appear in to be shown
+SMOOTH_FRAMES: int = 5       # number of frames kept for majority-vote smoothing
+SMOOTH_MIN_VOTES: int = 3    # minimum frames a note must appear in to be shown
+# Minimum dB (relative to peak) a candidate must reach to count as a "strong harmonic"
+# during harmonic-coverage scoring.  Weaker peaks are spectral leakage or room noise,
+# not genuine instrument partials.
+HARMONIC_SCORE_MIN_DB: float = -20.0
 
 # ── Vocal-mode constants ─────────────────────────────────────────────────────
 
@@ -77,25 +81,40 @@ def _suppress_harmonics(
     peaks: List[Tuple[float, float]]
 ) -> List[Tuple[float, float]]:
     """
-    Remove peaks that are integer harmonics of a stronger fundamental.
+    Remove peaks that are integer harmonics of any lower-frequency peak.
+
+    Two peaks are in a harmonic relationship when freq_high / freq_low is
+    within HARMONIC_TOL (±5%) of an integer ≥ 2.  In that case freq_high
+    is suppressed and freq_low (the fundamental) is kept — regardless of
+    which peak is louder.
+
+    This direction-agnostic check is essential for instruments like piano
+    where upper harmonics (especially the 2nd partial = octave above) are
+    often louder than the fundamental.  The original loudness-first approach
+    would keep the louder harmonic first and then fail to recognise the
+    quieter fundamental as the true root.
 
     peaks: list of (db_value, freq_hz), sorted loudest-first.
-    Returns a filtered list in the same order.
+    Returns a filtered list preserving the original loudness order.
     """
-    kept: List[Tuple[float, float]] = []
-    for db_val, freq in peaks:
-        is_harmonic = False
-        for _ref_db, ref_freq in kept:
-            for h in range(2, 9):
-                ratio = freq / (ref_freq * h)
-                if abs(ratio - 1.0) < HARMONIC_TOL:
-                    is_harmonic = True
-                    break
-            if is_harmonic:
-                break
-        if not is_harmonic:
-            kept.append((db_val, freq))
-    return kept
+    if not peaks:
+        return []
+
+    # Collect all candidate frequencies sorted ascending so we always compare
+    # a lower frequency against higher ones.
+    all_freqs = sorted(f for _, f in peaks)
+
+    # Mark every frequency that is an integer multiple of some lower frequency.
+    harmonics: set = set()
+    for i, f_low in enumerate(all_freqs):
+        for f_high in all_freqs[i + 1:]:
+            ratio = f_high / f_low
+            nearest_int = round(ratio)
+            if nearest_int >= 2 and abs(ratio - nearest_int) < HARMONIC_TOL:
+                harmonics.add(f_high)
+
+    # Return peaks not identified as harmonics, in the original loudness order.
+    return [(db, f) for db, f in peaks if f not in harmonics]
 
 
 def _find_peaks_in_band(
@@ -166,12 +185,60 @@ def _filter_close_notes(
     return kept
 
 
+def _harmonic_coverage(
+    f_hz: float,
+    all_peaks: List[Tuple[float, float]],
+) -> int:
+    """
+    Count how many peaks in all_peaks are strong upper harmonics of f_hz.
+
+    A peak qualifies when:
+      • its dB value is ≥ HARMONIC_SCORE_MIN_DB (i.e. within 20 dB of the frame peak)
+      • its frequency is above f_hz
+      • freq / f_hz is within HARMONIC_TOL of an integer ≥ 2
+
+    A high score indicates that f_hz is a genuine played fundamental with a
+    visible harmonic series.  A low score (0 or 1) suggests a sympathetic
+    resonance from another string, room reflection, or background noise.
+    """
+    count = 0
+    for db_val, peak_f in all_peaks:
+        if db_val < HARMONIC_SCORE_MIN_DB or peak_f <= f_hz:
+            continue
+        ratio = peak_f / f_hz
+        nearest_h = round(ratio)
+        if nearest_h >= 2 and abs(ratio - nearest_h) < HARMONIC_TOL:
+            count += 1
+    return count
+
+
 def _peaks_to_notes(peaks: List[Tuple[float, float]]) -> List[str]:
     """Convert (db, freq) peaks to deduplicated, well-separated note name strings."""
-    # Suppress harmonics first
+    # Step 1 — Suppress peaks that are integer harmonics of a lower frequency.
     filtered = _suppress_harmonics(peaks)
 
-    # Convert to note names, deduplicate keeping loudest per note
+    # Step 2 — Harmonic coverage filter.
+    #
+    # After harmonic suppression, surviving peaks are candidate fundamentals.
+    # A genuinely played note has multiple strong harmonics in the spectrum
+    # (score ≥ 2).  Sympathetic resonances (other strings vibrating in
+    # sympathy with the played note) produce only 0–1 detected harmonics.
+    #
+    # Rule: if at least one surviving note has a harmonic score ≥ 2, apply a
+    # coverage threshold (max_score − 2, minimum 1) so that all genuine chord
+    # tones pass while sympathetic resonances are suppressed.
+    #
+    # Fallback: when no note has score ≥ 2 (pure sine tests, high notes above
+    # ~E5 where few harmonics fit in FREQ_MAX, very quiet signals), all
+    # surviving notes are kept.
+    if filtered:
+        scores = {f: _harmonic_coverage(f, peaks) for _, f in filtered}
+        max_score = max(scores.values())
+        if max_score >= 2:
+            threshold = max(1, max_score - 2)
+            filtered = [(db, f) for db, f in filtered if scores[f] >= threshold]
+
+    # Step 3 — Convert to note names, deduplicate keeping loudest per note.
     seen: dict = {}
     for db_val, freq in filtered:
         note = freq_to_note(freq)
@@ -183,7 +250,7 @@ def _peaks_to_notes(peaks: List[Tuple[float, float]]) -> List[str]:
     # Sort by loudness
     ordered = sorted(seen.items(), key=lambda x: x[1], reverse=True)
 
-    # Remove notes that are too close in pitch to a louder note (≥3 semitones)
+    # Step 4 — Remove notes closer than 3 semitones to a louder neighbour.
     separated = _filter_close_notes(ordered, min_semitones=3)
 
     return [note for note, _ in separated[:MAX_NOTES]]
