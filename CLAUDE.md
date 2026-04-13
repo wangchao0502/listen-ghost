@@ -10,8 +10,14 @@ Windows 桌面小程序，监听声卡输出（WASAPI Loopback），实时显示
 ## 运行与测试
 
 ```bash
+# 创建虚拟环境（项目根目录）
+python -m venv .venv
+
+# 激活虚拟环境（PowerShell）
+.\.venv\Scripts\Activate.ps1
+
 # 安装依赖
-pip install soundcard numpy
+python -m pip install -r requirements.txt
 
 # 运行程序
 python main.py
